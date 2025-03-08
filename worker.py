@@ -7,6 +7,7 @@ import tempfile
 from argparse import Namespace
 from pydub import AudioSegment
 from aiogram import Bot, types
+import shutil
 
 pipe = Sonic(0)
 
@@ -54,7 +55,8 @@ def generator_handler(job):
         bot_token=job_input.get("bot_token", None),
         user_id=job_input.get("user_id", None),
         crop=job_input.get("crop", False),
-        dynamic_scale=job_input.get("dynamic_scale", 1.0)
+        dynamic_scale=job_input.get("dynamic_scale", 1.0),
+        temp_dir=temp_dir
     )
     if args.bot_token is None or args.user_id is None:
             return {
@@ -62,6 +64,9 @@ def generator_handler(job):
                     "error": "Bot token or user ID not provided"
                 }
             }
+    run_pipline(args)
+    
+def run_pipline(args):
     try:
         face_info = pipe.preprocess(args.image_path, expand_ratio=0.5)
         print(face_info)
@@ -74,11 +79,17 @@ def generator_handler(job):
             pipe.process(args.image_path, args.audio_path, args.output_path, min_resolution=512, inference_steps=25, dynamic_scale=args.dynamic_scale)
             bot = Bot(token=args.bot_token)
             if args.user_id:
-                asyncio.run(bot.send_document(args.user_id, types.InputFile(args.output_path)))
+                message: types.Message = asyncio.run(bot.send_video_note(args.user_id, types.InputFile(args.output_path)))
+                file_id = message.video_note.file_id
+            # Clean up temporary files
+            try:
+                shutil.rmtree(args.temp_dir, ignore_errors=True)
+                print(f"Cleaned up temporary directory: {args.temp_dir}")
+            except Exception as cleanup_error:
+                print(f"Error cleaning up temporary files: {str(cleanup_error)}")
             return {
                 "output": {
-                    "base64": base64.b64encode(open(output_path, "rb").read()).decode("utf-8"),
-                    "filename": "output.mp4"
+                    "output_file_id": file_id,
                 }
             }
         return {
