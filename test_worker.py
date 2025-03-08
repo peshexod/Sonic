@@ -63,9 +63,9 @@ async def generator_handler(job):
                     }
                 }
         #run_pipline(args)
-        bot = Bot(token=args.bot_token)
-        message = await bot.send_video_note(args.user_id, types.FSInputFile(args.output_path))
-        file_id = message.video_note.file_id
+        async with Bot(token=args.bot_token) as bot:
+            message = await bot.send_video_note(args.user_id, types.FSInputFile(args.output_path))
+            file_id = message.video_note.file_id
         # Clean up temporary files
         try:
             shutil.rmtree(args.temp_dir, ignore_errors=True)
