@@ -1,39 +1,57 @@
 import asyncio
 import runpod
-from sonic import Sonic
 import base64
 import os
 import tempfile
 from argparse import Namespace
 from pydub import AudioSegment
-from aiogram import Bot, types
 import shutil
+import json
 
-pipe = Sonic(0)
+from pipeline import SonicPipelineWrapper
+from models import SonicRequest, SonicResponse
+from output import send_to_telegram, upload_video_to_vk, upload_to_storage
+
+# Initialize pipeline (lazy load)
+_pipe = None
+
+
+def get_pipe():
+    """Lazy initialization of pipeline."""
+    global _pipe
+    if _pipe is None:
+        _pipe = SonicPipelineWrapper(device_id=0)
+    return _pipe
+
 
 async def generator_handler(job):
     try:
         # Parse input data
-        job_input = job["input"]
-        audio_input = job_input.get("audio_input", {})
-        image_input = job_input.get("image_input", {})
+        job_input = job.get("input", {})
+        
+        # Parse using Pydantic model
+        try:
+            request = SonicRequest(**job_input)
+        except Exception as e:
+            return {"output": {"error": f"Invalid request: {str(e)}"}}
 
         # Create temp directory for files
         temp_dir = tempfile.mkdtemp()
 
         # Save base64 image to file
-        image_data = image_input.get("base64", "")
-        image_filename = image_input.get("filename", "input.jpg")
+        image_data = request.image_input.base64
+        image_filename = request.image_input.filename
         image_path = os.path.join(temp_dir, image_filename)
         with open(image_path, "wb") as f:
             f.write(base64.b64decode(image_data))
 
         # Save base64 audio to file
-        audio_data = audio_input.get("base64", "")
-        audio_filename = audio_input.get("filename", "input.wav")
+        audio_data = request.audio_input.base64
+        audio_filename = request.audio_input.filename
         audio_path = os.path.join(temp_dir, audio_filename)
         with open(audio_path, "wb") as f:
             f.write(base64.b64decode(audio_data))
+
         # Convert audio from mp3 to wav if needed
         if audio_filename.lower().endswith('.mp3'):
             try:
@@ -45,70 +63,96 @@ async def generator_handler(job):
                 print("Warning: pydub not installed. MP3 to WAV conversion failed.")
             except Exception as e:
                 print(f"Error converting MP3 to WAV: {str(e)}")
+
         # Create output path
         output_path = os.path.join(temp_dir, "output.mp4")
 
-        # Create args namespace for compatibility with existing code
-        args = Namespace(
-            image_path=image_path,
-            audio_path=audio_path,
-            output_path=output_path,
-            bot_token=job_input.get("bot_token", None),
-            user_id=job_input.get("user_id", None),
-            crop=job_input.get("crop", False),
-            dynamic_scale=job_input.get("dynamic_scale", 1.0),
-            temp_dir=temp_dir
+        # Get pipeline and process
+        pipe = get_pipe()
+        
+        # Preprocess
+        face_info = pipe.preprocess(image_path, expand_ratio=0.5)
+        print(face_info)
+        
+        if face_info['face_num'] < 0:
+            raise Exception("No face detected")
+        
+        # Crop if requested
+        image_path_to_use = image_path
+        if request.crop:
+            crop_image_path = image_path + '.crop.png'
+            pipe.crop_image(image_path, crop_image_path, face_info['crop_bbox'])
+            image_path_to_use = crop_image_path
+        
+        # Process video
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        result = pipe.process(
+            image_path_to_use, 
+            audio_path, 
+            output_path, 
+            min_resolution=512, 
+            inference_steps=25, 
+            dynamic_scale=request.dynamic_scale
         )
-        if args.bot_token is None or args.user_id is None:
-                return {
-                    "output": {
-                        "error": "Bot token or user ID not provided"
-                    }
-                }
-        run_pipline(args)
-        async with Bot(token=args.bot_token) as bot:
-            message = await bot.send_video_note(args.user_id, types.FSInputFile(args.output_path))
-            file_id = message.video_note.file_id
+        
+        if result != 0:
+            raise Exception("Video processing failed")
+
+        # Initialize response
+        response_data = {}
+
+        # Determine output method based on request parameters
+        if request.telegram:
+            # Send to Telegram
+            file_id = await send_to_telegram(
+                bot_token=request.telegram.bot_token,
+                user_id=request.telegram.user_id,
+                video_path=output_path
+            )
+            response_data["telegram_file_id"] = file_id
+        
+        elif request.vk:
+            # Send to VK
+            message_id = upload_video_to_vk(
+                video_path=output_path,
+                group_token=request.vk.group_token,
+                user_id=request.vk.user_id,
+                title="Sonic Video",
+                description="Generated by Sonic"
+            )
+            response_data["vk_message_id"] = message_id
+        
+        elif request.storage:
+            # Upload to S3 storage
+            storage_url = upload_to_storage(
+                file_path=output_path,
+                endpoint=request.storage.endpoint,
+                bucket=request.storage.bucket,
+                access_key=request.storage.access_key,
+                secret_key=request.storage.secret_key
+            )
+            response_data["storage_url"] = storage_url
+        
+        else:
+            # Return base64 encoded video
+            with open(output_path, "rb") as f:
+                video_data = base64.b64encode(f.read()).decode('utf-8')
+            response_data["base64"] = video_data
+
         # Clean up temporary files
         try:
-            shutil.rmtree(args.temp_dir, ignore_errors=True)
-            #print(f"Cleaned up temporary directory: {args.temp_dir}")
+            shutil.rmtree(temp_dir, ignore_errors=True)
         except Exception as cleanup_error:
             print(f"Error cleaning up temporary files: {str(cleanup_error)}")
-        return {
-            "output": {
-                "output_file_id": file_id,
-            }
-        }
+
+        return {"output": response_data}
+
     except Exception as e:
-        return {
-            "output": {
-                "error": str(e)
-            }
-        }
-    
-def run_pipline(args):
-    try:
-        face_info = pipe.preprocess(args.image_path, expand_ratio=0.5)
-        print(face_info)
-        if face_info['face_num'] >= 0:
-            if args.crop:
-                crop_image_path = args.image_path + '.crop.png'
-                pipe.crop_image(args.image_path, crop_image_path, face_info['crop_bbox'])
-                args.image_path = crop_image_path
-            os.makedirs(os.path.dirname(args.output_path), exist_ok=True)
-            pipe.process(args.image_path, args.audio_path, args.output_path, min_resolution=512, inference_steps=25, dynamic_scale=args.dynamic_scale)
-        else:
-            raise Exception("No face detected")    
-    except Exception as e:
-        print(f"Error during processing: {str(e)}")
-        # Re-throw the exception so it's properly handled by the calling function
-        raise e
-        
+        return {"output": {"error": str(e)}}
+
 
 runpod.serverless.start(
     {
-        "handler": generator_handler,  # Required
-        #"return_aggregate_stream": True,  # Optional, results available via /run
+        "handler": generator_handler,
     }
 )
