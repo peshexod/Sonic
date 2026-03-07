@@ -11,6 +11,7 @@ import json
 from pipeline import SonicPipelineWrapper
 from models import SonicRequest, SonicResponse
 from output import send_to_telegram, upload_video_to_vk, upload_to_storage
+import concurrency
 
 # Initialize pipeline (lazy load)
 _pipe = None
@@ -154,5 +155,6 @@ async def generator_handler(job):
 runpod.serverless.start(
     {
         "handler": generator_handler,
+        "concurrency_modifier": concurrency.adjust_concurrency,
     }
 )
