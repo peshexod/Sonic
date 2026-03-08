@@ -15,3 +15,7 @@ huggingface_hub[cli]
 pydub
 aiogram
 opencv-python
+
+# System Monitoring (for concurrency modifier)
+pynvml
+psutil
