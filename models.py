@@ -34,6 +34,7 @@ class SonicRequest(BaseModel):
     image_input: ImageInput
     crop: bool = False
     dynamic_scale: float = 1.0
+    inference_steps: int = Field(default=20, ge=10, le=50)
     telegram: Optional[TelegramConfig] = None
     vk: Optional[VKConfig] = None
     storage: Optional[StorageConfig] = None

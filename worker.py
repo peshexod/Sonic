@@ -7,26 +7,29 @@ from argparse import Namespace
 from pydub import AudioSegment
 import shutil
 import json
+import time
 
 from pipeline import SonicPipelineWrapper
 from models import SonicRequest, SonicResponse
 from output import send_to_telegram, upload_video_to_vk, upload_to_storage
 import concurrency
 
-# Initialize pipeline (lazy load)
-_pipe = None
+# Initialize pipeline eagerly at module load time, before RunPod starts accepting jobs.
+# This prevents the concurrency modifier from seeing GPU=0% during model loading
+# and incorrectly allowing multiple jobs to start simultaneously.
+print("Initializing Sonic pipeline...")
+_pipe = SonicPipelineWrapper(device_id=0)
+print("Sonic pipeline ready.")
 
 
 def get_pipe():
-    """Lazy initialization of pipeline."""
-    global _pipe
-    if _pipe is None:
-        _pipe = SonicPipelineWrapper(device_id=0)
     return _pipe
 
 
 async def generator_handler(job):
     try:
+        t_total_start = time.time()
+
         # Parse input data
         job_input = job.get("input", {})
         
@@ -54,6 +57,9 @@ async def generator_handler(job):
             f.write(base64.b64decode(audio_data))
 
         # Convert audio from mp3 to wav if needed
+        t_decode_end = time.time()
+        print(f"[TIMING] base64 decode + file write: {t_decode_end - t_total_start:.2f}s")
+
         if audio_filename.lower().endswith('.mp3'):
             try:
                 mp3_path = audio_path
@@ -72,8 +78,10 @@ async def generator_handler(job):
         pipe = get_pipe()
         
         # Preprocess
+        t_preprocess_start = time.time()
         face_info = pipe.preprocess(image_path, expand_ratio=0.5)
         print(face_info)
+        print(f"[TIMING] preprocess (face detect): {time.time() - t_preprocess_start:.2f}s")
         
         if face_info['face_num'] < 0:
             raise Exception("No face detected")
@@ -87,14 +95,16 @@ async def generator_handler(job):
         
         # Process video
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        t_inference_start = time.time()
         result = pipe.process(
             image_path_to_use, 
             audio_path, 
             output_path, 
             min_resolution=512, 
-            inference_steps=25, 
+            inference_steps=request.inference_steps, 
             dynamic_scale=request.dynamic_scale
         )
+        print(f"[TIMING] inference + ffmpeg: {time.time() - t_inference_start:.2f}s")
         
         if result != 0:
             raise Exception("Video processing failed")
@@ -136,8 +146,10 @@ async def generator_handler(job):
         
         else:
             # Return base64 encoded video
+            t_encode_start = time.time()
             with open(output_path, "rb") as f:
                 video_data = base64.b64encode(f.read()).decode('utf-8')
+            print(f"[TIMING] base64 encode video: {time.time() - t_encode_start:.2f}s")
             response_data["base64"] = video_data
 
         # Clean up temporary files
@@ -146,6 +158,7 @@ async def generator_handler(job):
         except Exception as cleanup_error:
             print(f"Error cleaning up temporary files: {str(cleanup_error)}")
 
+        print(f"[TIMING] total job: {time.time() - t_total_start:.2f}s")
         return {"output": response_data}
 
     except Exception as e:

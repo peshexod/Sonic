@@ -1,4 +1,5 @@
 import os
+import time
 import torch
 import torch.utils.checkpoint
 from PIL import Image
@@ -285,7 +286,9 @@ class SonicPipelineWrapper:
         imSrc_ = Image.open(image_path).convert('RGB')
         raw_w, raw_h = imSrc_.size
 
+        t_preproc = time.time()
         test_data = image_audio_to_tensor(self.face_det, self.feature_extractor, image_path, audio_path, limit=config.frame_num, image_size=min_resolution, area=config.area)
+        print(f"[TIMING] image_audio_to_tensor: {time.time() - t_preproc:.2f}s")
         if test_data is None:
             return -1
         height, width = test_data['ref_img'].shape[-2:]
@@ -294,6 +297,7 @@ class SonicPipelineWrapper:
         else:
             resolution = f'{width}x{height}'
 
+        t0 = time.time()
         video = test(
             pipe,
             config,
@@ -305,12 +309,14 @@ class SonicPipelineWrapper:
             height=height,
             batch=test_data,
         )
+        print(f"[TIMING] diffusion inference: {time.time() - t0:.2f}s")
 
         if config.use_interframe:
             rife = self.rife
             out = video.to(device)
             results = []
             video_len = out.shape[2]
+            t_rife = time.time()
             for idx in tqdm(range(video_len-1), ncols=0):
                 I1 = out[:, :, idx]
                 I2 = out[:, :, idx+1]
@@ -319,10 +325,15 @@ class SonicPipelineWrapper:
                 results.append(middle)
             results.append(out[:, :, video_len-1])
             video = torch.stack(results, 2).cpu()
+            print(f"[TIMING] RIFE interpolation: {time.time() - t_rife:.2f}s")
 
+        t_save = time.time()
         save_videos_grid(video, video_path, n_rows=video.shape[0], fps=config.fps * 2 if config.use_interframe else config.fps)
+        print(f"[TIMING] save_videos_grid: {time.time() - t_save:.2f}s")
+        t_ffmpeg = time.time()
         ffmpeg_command = f'ffmpeg -i "{video_path}" -i "{audio_path}" -s {resolution} -vcodec libx264 -acodec aac -crf 18 -shortest -y "{audio_video_path}"'
         os.system(ffmpeg_command)
+        print(f"[TIMING] ffmpeg mux: {time.time() - t_ffmpeg:.2f}s")
         os.remove(video_path)
         
         return 0
